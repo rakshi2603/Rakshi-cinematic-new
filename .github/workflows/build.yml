@@ -5,9 +5,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -15,8 +19,9 @@ jobs:
       - name: Unzip Base Project
         run: |
           unzip -o "rakshi-cinematic-app*.zip"
+          mkdir -p app/src/main/java/com/rakshi/cinematic
 
-      - name: Write Self-Contained Engine & Compose UI
+      - name: Write Engine and Compose UI
         run: |
           cat << 'EOF' > app/src/main/java/com/rakshi/cinematic/MainActivity.kt
           package com.rakshi.cinematic
@@ -26,10 +31,14 @@ jobs:
           import android.net.Uri
           import android.os.Bundle
           import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
           import androidx.activity.result.contract.ActivityResultContracts
+
           import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
@@ -43,302 +52,620 @@ jobs:
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+
           import androidx.lifecycle.lifecycleScope
+
           import androidx.media3.common.MediaItem
-          import androidx.media3.transformer.*
+          import androidx.media3.transformer.Composition
+          import androidx.media3.transformer.EditedMediaItem
+          import androidx.media3.transformer.EditedMediaItemSequence
+          import androidx.media3.transformer.ExportException
+          import androidx.media3.transformer.ExportResult
+          import androidx.media3.transformer.ProgressHolder
+          import androidx.media3.transformer.Transformer
+
+          import kotlinx.coroutines.CancellationException
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.channels.awaitClose
           import kotlinx.coroutines.flow.Flow
           import kotlinx.coroutines.flow.callbackFlow
+          import kotlinx.coroutines.flow.flowOn
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
+
           import java.io.File
-          import java.util.Timer
-          import java.util.TimerTask
 
-          data class HighlightSegment(val sourceUri: Uri, val startMs: Long, val endMs: Long) {
-              val durationMs: Long get() = endMs - startMs
+          data class HighlightSegment(
+              val sourceUri: Uri,
+              val startMs: Long,
+              val endMs: Long
+          ) {
+              val durationMs: Long
+                  get() = endMs - startMs
           }
-
-          enum class MountType(val label: String, val detail: String) {
-              BIKE_HELMET("Motorcycle • Helmet POV", "High vibration & lean dynamics detected. Adaptive stabilization profile active."),
-              CAR_CABIN("Automobile • Cockpit POV", "Dual-zone windshield contrast detected. Tone-mapping & cockpit grading active."),
-              CAR_DASH("Automobile • Windshield Dashcam", "Rigid chassis forward motion profile detected.")
-          }
-
-          data class DetectionInfo(val mount: MountType, val confidence: Int)
 
           object VideoAnalysisEngine {
-              fun analyzeFootage(durationMs: Long, uri: Uri): Pair<DetectionInfo, List<HighlightSegment>> {
-                  val mount = if (durationMs % 2L == 0L) MountType.BIKE_HELMET else MountType.CAR_CABIN
-                  val detection = DetectionInfo(mount, 94)
-
-                  val totalTargetMs = 60_000L.coerceAtMost(durationMs)
-                  val segmentCount = 10
-                  val clipDurationMs = (totalTargetMs / segmentCount).coerceAtLeast(1000L)
-                  val step = if (durationMs > totalTargetMs) (durationMs - totalTargetMs) / segmentCount else 0L
-
-                  val cuts = mutableListOf<HighlightSegment>()
-                  var current = 0L
-                  for (i in 0 until segmentCount) {
-                      val end = (current + clipDurationMs).coerceAtMost(durationMs)
-                      cuts.add(HighlightSegment(uri, current, end))
-                      current = (current + clipDurationMs + step).coerceAtMost(durationMs)
+              fun selectClips(
+                  durationMs: Long,
+                  uri: Uri,
+                  targetMs: Long = 60_000L
+              ): List<HighlightSegment> {
+                  require(durationMs > 0L) {
+                      "Could not read a valid video duration."
                   }
-                  return Pair(detection, cuts)
+                  require(targetMs > 0L)
+
+                  val selectedMs = minOf(durationMs, targetMs)
+                  val segmentCount = minOf(
+                      10L,
+                      (selectedMs / 1000L).coerceAtLeast(1L)
+                  ).toInt()
+
+                  val baseLength = selectedMs / segmentCount
+                  val remainder = selectedMs % segmentCount
+                  val unusedMs = durationMs - selectedMs
+
+                  var consumedMs = 0L
+
+                  return List(segmentCount) { index ->
+                      val lengthMs = baseLength +
+                          if (index.toLong() < remainder) 1L else 0L
+
+                      val gapOffset = if (segmentCount > 1) {
+                          unusedMs * index / (segmentCount - 1)
+                      } else {
+                          unusedMs / 2L
+                      }
+
+                      val startMs = consumedMs + gapOffset
+                      consumedMs += lengthMs
+
+                      HighlightSegment(
+                          sourceUri = uri,
+                          startMs = startMs,
+                          endMs = startMs + lengthMs
+                      )
+                  }
               }
           }
 
-          class SimpleRenderEngine(private val context: Context) {
+          class SimpleRenderEngine(
+              private val context: Context
+          ) {
               sealed interface RenderState {
-                  data class Progress(val percentage: Int) : RenderState
-                  data class Completed(val file: File) : RenderState
-                  data class Error(val message: String) : RenderState
+                  data class Progress(
+                      val percentage: Int
+                  ) : RenderState
+
+                  data class Completed(
+                      val file: File
+                  ) : RenderState
+
+                  data class Error(
+                      val message: String
+                  ) : RenderState
               }
 
-              fun export60sReel(cuts: List<HighlightSegment>, outputFile: File): Flow<RenderState> = callbackFlow {
+              fun exportReel(
+                  cuts: List<HighlightSegment>,
+                  outputFile: File
+              ): Flow<RenderState> = callbackFlow {
+                  val handler = Handler(Looper.getMainLooper())
+                  var transformer: Transformer? = null
+                  var progressTask: Runnable? = null
+                  var finished = false
+
                   try {
+                      require(cuts.isNotEmpty()) {
+                          "No clips selected."
+                      }
+
+                      cuts.forEach { cut ->
+                          require(
+                              cut.startMs >= 0L &&
+                              cut.endMs > cut.startMs
+                          ) {
+                              "Invalid clip boundaries."
+                          }
+                      }
+
+                      outputFile.parentFile?.let { directory ->
+                          check(
+                              directory.isDirectory ||
+                              directory.mkdirs()
+                          ) {
+                              "Could not create output directory."
+                          }
+                      }
+
+                      if (outputFile.exists()) {
+                          check(outputFile.delete()) {
+                              "Could not replace output file."
+                          }
+                      }
+
                       val items = cuts.map { cut ->
-                          val clip = MediaItem.ClippingConfiguration.Builder()
-                              .setStartPositionMs(cut.startMs)
-                              .setEndPositionMs(cut.endMs)
-                              .build()
+                          val clipping =
+                              MediaItem.ClippingConfiguration.Builder()
+                                  .setStartPositionMs(cut.startMs)
+                                  .setEndPositionMs(cut.endMs)
+                                  .build()
+
                           val mediaItem = MediaItem.Builder()
                               .setUri(cut.sourceUri)
-                              .setClippingConfiguration(clip)
+                              .setClippingConfiguration(clipping)
                               .build()
+
                           EditedMediaItem.Builder(mediaItem).build()
                       }
 
                       val sequence = EditedMediaItemSequence(items)
-                      val composition = Composition.Builder(listOf(sequence)).build()
+                      val composition =
+                          Composition.Builder(listOf(sequence)).build()
 
-                      val transformer = Transformer.Builder(context)
-                          .addListener(object : Transformer.Listener {
-                              override fun onCompleted(comp: Composition, result: ExportResult) {
-                                  trySend(RenderState.Completed(outputFile))
-                                  close()
+                      val exporter = Transformer.Builder(context)
+                          .addListener(
+                              object : Transformer.Listener {
+                                  override fun onCompleted(
+                                      composition: Composition,
+                                      exportResult: ExportResult
+                                  ) {
+                                      finished = true
+                                      trySend(RenderState.Progress(100))
+                                      trySend(
+                                          RenderState.Completed(outputFile)
+                                      )
+                                      close()
+                                  }
+
+                                  override fun onError(
+                                      composition: Composition,
+                                      exportResult: ExportResult,
+                                      exportException: ExportException
+                                  ) {
+                                      finished = true
+                                      trySend(
+                                          RenderState.Error(
+                                              exportException.message
+                                                  ?: "Export failed."
+                                          )
+                                      )
+                                      close()
+                                  }
                               }
-                              override fun onError(comp: Composition, result: ExportResult, exception: ExportException) {
-                                  trySend(RenderState.Error(exception.message ?: "Render failed"))
-                                  close(exception)
-                              }
-                          })
+                          )
                           .build()
 
-                      if (outputFile.exists()) outputFile.delete()
-                      transformer.start(composition, outputFile.absolutePath)
-
+                      transformer = exporter
                       val holder = ProgressHolder()
-                      val timer = Timer()
-                      timer.scheduleAtFixedRate(object : TimerTask() {
+
+                      val poller = object : Runnable {
                           override fun run() {
-                              if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
-                                  trySend(RenderState.Progress(holder.progress))
+                              if (finished || isClosedForSend) {
+                                  return
+                              }
+
+                              try {
+                                  val state =
+                                      exporter.getProgress(holder)
+
+                                  if (
+                                      state ==
+                                      Transformer.PROGRESS_STATE_AVAILABLE
+                                  ) {
+                                      trySend(
+                                          RenderState.Progress(
+                                              holder.progress
+                                                  .coerceIn(0, 100)
+                                          )
+                                      )
+                                  }
+
+                                  handler.postDelayed(this, 300L)
+                              } catch (error: Exception) {
+                                  finished = true
+                                  trySend(
+                                      RenderState.Error(
+                                          error.message
+                                              ?: "Progress check failed."
+                                      )
+                                  )
+                                  close()
                               }
                           }
-                      }, 200, 300)
-
-                      awaitClose {
-                          timer.cancel()
-                          transformer.cancel()
                       }
-                  } catch (e: Exception) {
-                      trySend(RenderState.Error(e.message ?: "Initialization error"))
-                      close(e)
+
+                      progressTask = poller
+                      exporter.start(
+                          composition,
+                          outputFile.absolutePath
+                      )
+                      handler.postDelayed(poller, 200L)
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (error: Exception) {
+                      finished = true
+                      trySend(
+                          RenderState.Error(
+                              error.message
+                                  ?: "Could not initialize export."
+                          )
+                      )
+                      close()
                   }
-              }
+
+                  awaitClose {
+                      finished = true
+
+                      progressTask?.let {
+                          handler.removeCallbacks(it)
+                      }
+
+                      val activeTransformer = transformer
+                      if (activeTransformer != null) {
+                          if (
+                              Looper.myLooper() ==
+                              Looper.getMainLooper()
+                          ) {
+                              activeTransformer.cancel()
+                          } else {
+                              handler.post {
+                                  activeTransformer.cancel()
+                              }
+                          }
+                      }
+                  }
+              }.flowOn(Dispatchers.Main.immediate)
           }
 
           class MainActivity : ComponentActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
+              override fun onCreate(
+                  savedInstanceState: Bundle?
+              ) {
                   super.onCreate(savedInstanceState)
-                  val renderEngine = SimpleRenderEngine(applicationContext)
+
+                  val renderEngine =
+                      SimpleRenderEngine(applicationContext)
 
                   setContent {
-                      var statusMessage by remember { mutableStateOf("Select raw GoPro footage to begin") }
-                      var isAnalyzing by remember { mutableStateOf(false) }
-                      var isRendering by remember { mutableStateOf(false) }
-                      var renderProgress by remember { mutableIntStateOf(0) }
-                      var detectedInfo by remember { mutableStateOf<DetectionInfo?>(null) }
-                      var highlightCuts by remember { mutableStateOf<List<HighlightSegment>>(emptyList()) }
-                      var exportedPath by remember { mutableStateOf<String?>(null) }
-
-                      val videoPicker = rememberLauncherForActivityResult(
-                          contract = ActivityResultContracts.GetContent()
-                      ) { uri: Uri? ->
-                          if (uri != null) {
-                              isAnalyzing = true
-                              statusMessage = "Analyzing motion kinematics & contrast..."
-                              exportedPath = null
-
-                              lifecycleScope.launch(Dispatchers.IO) {
-                                  var durationMs = 60_000L
-                                  val retriever = MediaMetadataRetriever()
-                                  try {
-                                      retriever.setDataSource(applicationContext, uri)
-                                      val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                                      if (dur != null) durationMs = dur.toLong()
-                                  } catch (_: Exception) {
-                                  } finally {
-                                      try { retriever.release() } catch (_: Exception) {}
-                                  }
-
-                                  val (detection, cuts) = VideoAnalysisEngine.analyzeFootage(durationMs, uri)
-
-                                  withContext(Dispatchers.Main) {
-                                      detectedInfo = detection
-                                      highlightCuts = cuts
-                                      isAnalyzing = false
-                                      statusMessage = "Timeline ready (${cuts.size} synced cuts)"
-                                  }
-                              }
+                      MaterialTheme {
+                          var statusMessage by remember {
+                              mutableStateOf(
+                                  "Select GoPro footage to begin."
+                              )
                           }
-                      }
-
-                      Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0F1015)) {
-                          Column(
-                              modifier = Modifier
-                                  .fillMaxSize()
-                                  .padding(24.dp),
-                              horizontalAlignment = Alignment.CenterHorizontally
-                          ) {
-                              Text(
-                                  "RAKSHI CINEMATIC AI",
-                                  color = Color.White,
-                                  fontSize = 22.sp,
-                                  fontWeight = FontWeight.Bold
+                          var isAnalyzing by remember {
+                              mutableStateOf(false)
+                          }
+                          var isRendering by remember {
+                              mutableStateOf(false)
+                          }
+                          var renderProgress by remember {
+                              mutableIntStateOf(0)
+                          }
+                          var cuts by remember {
+                              mutableStateOf(
+                                  emptyList<HighlightSegment>()
                               )
-                              Text(
-                                  "SAMSUNG S25 ULTRA • HARDWARE ACCELERATED",
-                                  color = Color(0xFFFF5722),
-                                  fontSize = 11.sp,
-                                  fontWeight = FontWeight.SemiBold,
-                                  modifier = Modifier.padding(top = 4.dp, bottom = 20.dp)
-                              )
+                          }
+                          var exportedPath by remember {
+                              mutableStateOf<String?>(null)
+                          }
 
-                              if (isAnalyzing) {
-                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                          CircularProgressIndicator(color = Color(0xFFFF5722))
-                                          Spacer(modifier = Modifier.height(16.dp))
-                                          Text(statusMessage, color = Color.LightGray, fontSize = 14.sp)
-                                      }
-                                  }
-                              } else if (isRendering) {
-                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                          Text("Exporting 60s Reel...", color = Color.White, fontWeight = FontWeight.SemiBold)
-                                          Spacer(modifier = Modifier.height(16.dp))
-                                          LinearProgressIndicator(
-                                              progress = { renderProgress / 100f },
-                                              modifier = Modifier.fillMaxWidth().height(8.dp),
-                                              color = Color(0xFFFF5722)
-                                          )
-                                          Spacer(modifier = Modifier.height(8.dp))
-                                          Text("$renderProgress%", color = Color.LightGray)
-                                      }
-                                  }
-                              } else if (detectedInfo != null && highlightCuts.isNotEmpty()) {
-                                  Column(modifier = Modifier.weight(1f)) {
-                                      Card(
-                                          modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-                                          colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1D26))
-                                      ) {
-                                          Column(modifier = Modifier.padding(14.dp)) {
-                                              Text(
-                                                  detectedInfo!!.mount.label,
-                                                  color = Color(0xFFFF9800),
-                                                  fontWeight = FontWeight.Bold,
-                                                  fontSize = 16.sp
-                                              )
-                                              Text(
-                                                  detectedInfo!!.mount.detail,
-                                                  color = Color.LightGray,
-                                                  fontSize = 12.sp,
-                                                  modifier = Modifier.padding(top = 4.dp)
-                                              )
-                                          }
-                                      }
+                          val picker =
+                              rememberLauncherForActivityResult(
+                                  ActivityResultContracts.GetContent()
+                              ) { uri: Uri? ->
+                                  if (uri != null) {
+                                      isAnalyzing = true
+                                      cuts = emptyList()
+                                      exportedPath = null
+                                      statusMessage =
+                                          "Reading video duration..."
 
-                                      Text(
-                                          "Generated 60s Cuts (${highlightCuts.size} segments):",
-                                          color = Color.White,
-                                          fontSize = 13.sp,
-                                          fontWeight = FontWeight.SemiBold,
-                                          modifier = Modifier.padding(bottom = 8.dp)
-                                      )
+                                      lifecycleScope.launch {
+                                          try {
+                                              val durationMs =
+                                                  withContext(
+                                                      Dispatchers.IO
+                                                  ) {
+                                                      val retriever =
+                                                          MediaMetadataRetriever()
 
-                                      LazyColumn(modifier = Modifier.weight(1f)) {
-                                          itemsIndexed(highlightCuts) { index, cut ->
-                                              Row(
-                                                  modifier = Modifier
-                                                      .fillMaxWidth()
-                                                      .padding(vertical = 3.dp)
-                                                      .background(Color(0xFF151720), RoundedCornerShape(8.dp))
-                                                      .padding(horizontal = 12.dp, vertical = 8.dp),
-                                                  horizontalArrangement = Arrangement.SpaceBetween
-                                              ) {
-                                                  Text("Cut #${index + 1}", color = Color.White, fontSize = 13.sp)
-                                                  Text(
-                                                      "${cut.startMs / 1000}s - ${cut.endMs / 1000}s (${cut.durationMs / 1000}s)",
-                                                      color = Color.Gray,
-                                                      fontSize = 13.sp
-                                                  )
-                                              }
-                                          }
-                                      }
+                                                      try {
+                                                          retriever
+                                                              .setDataSource(
+                                                                  applicationContext,
+                                                                  uri
+                                                              )
 
-                                      if (exportedPath != null) {
-                                          Text(
-                                              "Saved: $exportedPath",
-                                              color = Color(0xFF4CAF50),
-                                              fontSize = 13.sp,
-                                              modifier = Modifier.padding(vertical = 8.dp)
-                                          )
-                                      }
+                                                          val duration =
+                                                              retriever
+                                                                  .extractMetadata(
+                                                                      MediaMetadataRetriever
+                                                                          .METADATA_KEY_DURATION
+                                                                  )
+                                                                  ?.toLongOrNull()
 
-                                      Button(
-                                          onClick = {
-                                              isRendering = true
-                                              renderProgress = 0
-                                              lifecycleScope.launch {
-                                                  val moviesDir = applicationContext.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-                                                  val outFile = File(moviesDir, "RAKSHI_REEL_${System.currentTimeMillis()}.mp4")
-                                                  renderEngine.export60sReel(highlightCuts, outFile).collect { state ->
-                                                      when (state) {
-                                                          is SimpleRenderEngine.RenderState.Progress -> renderProgress = state.percentage
-                                                          is SimpleRenderEngine.RenderState.Completed -> {
-                                                              isRendering = false
-                                                              exportedPath = outFile.name
-                                                              statusMessage = "Render Complete!"
+                                                          require(
+                                                              duration != null &&
+                                                              duration > 0L
+                                                          ) {
+                                                              "Cannot read this video's duration."
                                                           }
-                                                          is SimpleRenderEngine.RenderState.Error -> {
-                                                              isRendering = false
-                                                              statusMessage = "Render Error: ${state.message}"
+
+                                                          duration
+                                                      } finally {
+                                                          try {
+                                                              retriever.release()
+                                                          } catch (
+                                                              _: Exception
+                                                          ) {
                                                           }
                                                       }
                                                   }
-                                              }
-                                          },
-                                          modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
-                                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
-                                      ) {
-                                          Text("Render 60s Reel on Snapdragon")
+
+                                              cuts =
+                                                  VideoAnalysisEngine
+                                                      .selectClips(
+                                                          durationMs,
+                                                          uri
+                                                      )
+
+                                              val seconds =
+                                                  cuts.sumOf {
+                                                      it.durationMs
+                                                  } / 1000.0
+
+                                              statusMessage =
+                                                  "Ready: ${cuts.size} clips, ${seconds}s total."
+                                          } catch (
+                                              cancelled:
+                                                  CancellationException
+                                          ) {
+                                              throw cancelled
+                                          } catch (error: Exception) {
+                                              statusMessage =
+                                                  error.message
+                                                      ?: "Could not read video."
+                                          } finally {
+                                              isAnalyzing = false
+                                          }
                                       }
                                   }
-                              } else {
-                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                          Button(
-                                              onClick = { videoPicker.launch("video/*") },
-                                              colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
+                              }
+
+                          Surface(
+                              modifier = Modifier.fillMaxSize(),
+                              color = Color(0xFF0F1015)
+                          ) {
+                              Column(
+                                  modifier = Modifier
+                                      .fillMaxSize()
+                                      .systemBarsPadding()
+                                      .padding(20.dp),
+                                  horizontalAlignment =
+                                      Alignment.CenterHorizontally
+                              ) {
+                                  Text(
+                                      text = "RAKSHI CINEMATIC",
+                                      color = Color.White,
+                                      fontSize = 24.sp,
+                                      fontWeight = FontWeight.Bold
+                                  )
+
+                                  Text(
+                                      text = "LOCAL VIDEO EDITOR",
+                                      color = Color(0xFFFF5722),
+                                      fontSize = 12.sp,
+                                      modifier =
+                                          Modifier.padding(top = 6.dp)
+                                  )
+
+                                  Spacer(
+                                      Modifier.height(18.dp)
+                                  )
+
+                                  Text(
+                                      text = statusMessage,
+                                      color = Color.LightGray,
+                                      fontSize = 14.sp
+                                  )
+
+                                  Spacer(
+                                      Modifier.height(12.dp)
+                                  )
+
+                                  if (isAnalyzing) {
+                                      CircularProgressIndicator(
+                                          color = Color(0xFFFF5722)
+                                      )
+                                  }
+
+                                  if (isRendering) {
+                                      LinearProgressIndicator(
+                                          progress = {
+                                              renderProgress / 100f
+                                          },
+                                          modifier = Modifier
+                                              .fillMaxWidth()
+                                              .height(8.dp),
+                                          color = Color(0xFFFF5722)
+                                      )
+
+                                      Text(
+                                          text =
+                                              "$renderProgress% exported",
+                                          color = Color.White,
+                                          modifier = Modifier
+                                              .padding(top = 8.dp)
+                                      )
+                                  }
+
+                                  Spacer(
+                                      Modifier.height(12.dp)
+                                  )
+
+                                  Text(
+                                      text =
+                                          "Evenly spaced clip selection • Up to 60 seconds",
+                                      color = Color.Gray,
+                                      fontSize = 12.sp
+                                  )
+
+                                  LazyColumn(
+                                      modifier = Modifier
+                                          .weight(1f)
+                                          .fillMaxWidth()
+                                          .padding(vertical = 12.dp)
+                                  ) {
+                                      itemsIndexed(cuts) {
+                                          index, cut ->
+
+                                          Row(
+                                              modifier = Modifier
+                                                  .fillMaxWidth()
+                                                  .padding(
+                                                      vertical = 4.dp
+                                                  )
+                                                  .background(
+                                                      Color(0xFF1B1D26),
+                                                      RoundedCornerShape(
+                                                          10.dp
+                                                      )
+                                                  )
+                                                  .padding(12.dp),
+                                              horizontalArrangement =
+                                                  Arrangement.SpaceBetween
                                           ) {
-                                              Text("Select GoPro Footage")
+                                              Text(
+                                                  text =
+                                                      "Clip ${index + 1}",
+                                                  color = Color.White
+                                              )
+
+                                              Text(
+                                                  text =
+                                                      "${cut.startMs / 1000.0}s – ${cut.endMs / 1000.0}s",
+                                                  color =
+                                                      Color.LightGray
+                                              )
                                           }
-                                          Spacer(modifier = Modifier.height(16.dp))
-                                          Text(statusMessage, color = Color.LightGray, fontSize = 13.sp)
                                       }
+                                  }
+
+                                  exportedPath?.let { path ->
+                                      Text(
+                                          text = "Saved:\n$path",
+                                          color = Color(0xFF4CAF50),
+                                          fontSize = 12.sp,
+                                          modifier = Modifier
+                                              .fillMaxWidth()
+                                              .padding(bottom = 12.dp)
+                                      )
+                                  }
+
+                                  Button(
+                                      onClick = {
+                                          picker.launch("video/*")
+                                      },
+                                      enabled =
+                                          !isAnalyzing &&
+                                          !isRendering,
+                                      modifier =
+                                          Modifier.fillMaxWidth()
+                                  ) {
+                                      Text("Select GoPro Footage")
+                                  }
+
+                                  Button(
+                                      onClick = {
+                                          val selectedCuts =
+                                              cuts.toList()
+
+                                          isRendering = true
+                                          renderProgress = 0
+                                          exportedPath = null
+                                          statusMessage =
+                                              "Exporting locally..."
+
+                                          lifecycleScope.launch {
+                                              try {
+                                                  val directory =
+                                                      applicationContext
+                                                          .getExternalFilesDir(
+                                                              Environment
+                                                                  .DIRECTORY_MOVIES
+                                                          )
+                                                          ?: error(
+                                                              "Movie storage is unavailable."
+                                                          )
+
+                                                  val output = File(
+                                                      directory,
+                                                      "RAKSHI_REEL_${System.currentTimeMillis()}.mp4"
+                                                  )
+
+                                                  renderEngine
+                                                      .exportReel(
+                                                          selectedCuts,
+                                                          output
+                                                      )
+                                                      .collect { state ->
+                                                          when (state) {
+                                                              is SimpleRenderEngine
+                                                                  .RenderState
+                                                                  .Progress -> {
+                                                                  renderProgress =
+                                                                      state.percentage
+                                                              }
+
+                                                              is SimpleRenderEngine
+                                                                  .RenderState
+                                                                  .Completed -> {
+                                                                  exportedPath =
+                                                                      state.file
+                                                                          .absolutePath
+                                                                  statusMessage =
+                                                                      "Export complete."
+                                                              }
+
+                                                              is SimpleRenderEngine
+                                                                  .RenderState
+                                                                  .Error -> {
+                                                                  statusMessage =
+                                                                      "Export failed: ${state.message}"
+                                                              }
+                                                          }
+                                                      }
+                                              } catch (
+                                                  cancelled:
+                                                      CancellationException
+                                              ) {
+                                                  throw cancelled
+                                              } catch (
+                                                  error: Exception
+                                              ) {
+                                                  statusMessage =
+                                                      "Export failed: ${error.message}"
+                                              } finally {
+                                                  isRendering = false
+                                              }
+                                          }
+                                      },
+                                      enabled =
+                                          cuts.isNotEmpty() &&
+                                          !isAnalyzing &&
+                                          !isRendering,
+                                      modifier =
+                                          Modifier.fillMaxWidth(),
+                                      colors =
+                                          ButtonDefaults.buttonColors(
+                                              containerColor =
+                                                  Color(0xFFFF5722)
+                                          )
+                                  ) {
+                                      Text("Export Reel")
                                   }
                               }
                           }
@@ -351,7 +678,7 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
       - name: Setup Gradle
@@ -367,4 +694,5 @@ jobs:
         with:
           name: RakshiCinematicAI-Debug-APK
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
           retention-days: 7
