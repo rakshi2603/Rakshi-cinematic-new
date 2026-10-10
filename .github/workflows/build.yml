@@ -16,6 +16,237 @@ jobs:
         run: |
           unzip -o "rakshi-cinematic-app*.zip"
 
+      - name: Inject Full Cinematic Engine & UI
+        run: |
+          cat << 'EOF' > app/src/main/java/com/rakshi/cinematic/MainActivity.kt
+          package com.rakshi.cinematic
+
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.lifecycleScope
+          import com.rakshi.cinematic.data.GpmfTelemetryParser
+          import com.rakshi.cinematic.domain.*
+          import com.rakshi.cinematic.engine.CinematicRenderEngine
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val parser = GpmfTelemetryParser(applicationContext)
+                  val classifier = AutoMountClassifier()
+                  val scorer = MultiPresetHighlightScorer()
+                  val engine = CinematicRenderEngine(applicationContext)
+
+                  setContent {
+                      var statusMessage by remember { mutableStateOf("Select raw GoPro footage to begin") }
+                      var isAnalyzing by remember { mutableStateOf(false) }
+                      var isRendering by remember { mutableStateOf(false) }
+                      var renderProgress by remember { mutableIntStateOf(0) }
+                      var detectedMount by remember { mutableStateOf<DetectionResult?>(null) }
+                      var highlightCuts by remember { mutableStateOf<List<HighlightSegment>>(emptyList()) }
+                      var exportedPath by remember { mutableStateOf<String?>(null) }
+
+                      val videoPicker = rememberLauncherForActivityResult(
+                          contract = ActivityResultContracts.GetContent()
+                      ) { uri: Uri? ->
+                          if (uri != null) {
+                              isAnalyzing = true
+                              statusMessage = "Reading GoPro telemetry & motion profile..."
+                              exportedPath = null
+
+                              lifecycleScope.launch(Dispatchers.IO) {
+                                  val telemetry = parser.extractTelemetry(uri, 60_000L)
+                                  val detection = classifier.detect(telemetry)
+                                  val preset = if (detection.mount == MountPerspective.BIKE_HELMET_POV) PresetType.BIKE else PresetType.CAR
+                                  val cuts = scorer.scoreAndSelectClips(
+                                      VideoMetadata(uri, 60_000L, telemetry),
+                                      preset,
+                                      60_000L
+                                  )
+
+                                  withContext(Dispatchers.Main) {
+                                      detectedMount = detection
+                                      highlightCuts = cuts
+                                      isAnalyzing = false
+                                      statusMessage = "Ready: ${cuts.size} clips synced for 60s reel"
+                                  }
+                              }
+                          }
+                      }
+
+                      Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0E1015)) {
+                          Column(
+                              modifier = Modifier
+                                  .fillMaxSize()
+                                  .padding(24.dp),
+                              horizontalAlignment = Alignment.CenterHorizontally
+                          ) {
+                              Text(
+                                  "RAKSHI CINEMATIC AI",
+                                  color = Color.White,
+                                  fontSize = 22.sp,
+                                  fontWeight = FontWeight.Bold
+                              )
+                              Text(
+                                  "SAMSUNG S25 ULTRA • HARDWARE ACCELERATED",
+                                  color = Color(0xFFFF5722),
+                                  fontSize = 11.sp,
+                                  fontWeight = FontWeight.SemiBold,
+                                  modifier = Modifier.padding(top = 4.dp, bottom = 20.dp)
+                              )
+
+                              if (isAnalyzing) {
+                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          CircularProgressIndicator(color = Color(0xFFFF5722))
+                                          Spacer(modifier = Modifier.height(16.dp))
+                                          Text(statusMessage, color = Color.LightGray, fontSize = 14.sp)
+                                      }
+                                  }
+                              } else if (isRendering) {
+                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Text("Exporting 60s 4K HEVC Reel...", color = Color.White, fontWeight = FontWeight.SemiBold)
+                                          Spacer(modifier = Modifier.height(16.dp))
+                                          LinearProgressIndicator(
+                                              progress = { renderProgress / 100f },
+                                              modifier = Modifier.fillMaxWidth().height(8.dp),
+                                              color = Color(0xFFFF5722)
+                                          )
+                                          Spacer(modifier = Modifier.height(8.dp))
+                                          Text("${renderProgress}%", color = Color.LightGray)
+                                      }
+                                  }
+                              } else if (detectedMount != null && highlightCuts.isNotEmpty()) {
+                                  Column(modifier = Modifier.weight(1f)) {
+                                      Card(
+                                          modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                                          colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1D26))
+                                      ) {
+                                          Column(modifier = Modifier.padding(14.dp)) {
+                                              Text(
+                                                  detectedMount!!.mount.title,
+                                                  color = Color(0xFFFF9800),
+                                                  fontWeight = FontWeight.Bold,
+                                                  fontSize = 16.sp
+                                              )
+                                              Text(
+                                                  detectedMount!!.rationale,
+                                                  color = Color.LightGray,
+                                                  fontSize = 12.sp,
+                                                  modifier = Modifier.padding(top = 4.dp)
+                                              )
+                                          }
+                                      }
+
+                                      Text(
+                                          "Generated 60s Cuts (${highlightCuts.size} segments):",
+                                          color = Color.White,
+                                          fontSize = 13.sp,
+                                          fontWeight = FontWeight.SemiBold,
+                                          modifier = Modifier.padding(bottom = 8.dp)
+                                      )
+
+                                      LazyColumn(modifier = Modifier.weight(1f)) {
+                                          itemsIndexed(highlightCuts) { index, cut ->
+                                              Row(
+                                                  modifier = Modifier
+                                                      .fillMaxWidth()
+                                                      .padding(vertical = 3.dp)
+                                                      .background(Color(0xFF151720), RoundedCornerShape(8.dp))
+                                                      .padding(horizontal = 12.dp, vertical = 8.dp),
+                                                  horizontalArrangement = Arrangement.SpaceBetween
+                                              ) {
+                                                  Text("Cut #${index + 1}", color = Color.White, fontSize = 13.sp)
+                                                  Text(
+                                                      "${cut.startMs / 1000}s - ${cut.endMs / 1000}s (${cut.durationMs / 1000}s)",
+                                                      color = Color.Gray,
+                                                      fontSize = 13.sp
+                                                  )
+                                              }
+                                          }
+                                      }
+
+                                      if (exportedPath != null) {
+                                          Text(
+                                              "Saved to Movies: $exportedPath",
+                                              color = Color(0xFF4CAF50),
+                                              fontSize = 12.sp,
+                                              modifier = Modifier.padding(vertical = 8.dp)
+                                          )
+                                      }
+
+                                      Button(
+                                          onClick = {
+                                              isRendering = true
+                                              lifecycleScope.launch {
+                                                  val moviesDir = applicationContext.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+                                                  val outFile = File(moviesDir, "RAKSHI_REEL_${System.currentTimeMillis()}.mp4")
+                                                  engine.render(highlightCuts, outFile).collect { state ->
+                                                      when (state) {
+                                                          is CinematicRenderEngine.RenderState.Progress -> renderProgress = state.percentage
+                                                          is CinematicRenderEngine.RenderState.Completed -> {
+                                                              isRendering = false
+                                                              exportedPath = outFile.name
+                                                              statusMessage = "Render Complete!"
+                                                          }
+                                                          is CinematicRenderEngine.RenderState.Error -> {
+                                                              isRendering = false
+                                                              statusMessage = "Render Failed: ${state.throwable.message}"
+                                                          }
+                                                      }
+                                                  }
+                                              }
+                                          },
+                                          modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
+                                      ) {
+                                          Text("Render 60s Reel on Snapdragon")
+                                      }
+                                  }
+                              } else {
+                                  Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                          Button(
+                                              onClick = { videoPicker.launch("video/*") },
+                                              colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5722))
+                                          ) {
+                                              Text("Select GoPro Footage")
+                                          }
+                                          Spacer(modifier = Modifier.height(16.dp))
+                                          Text(statusMessage, color = Color.LightGray, fontSize = 13.sp)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
