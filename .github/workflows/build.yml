@@ -21,12 +21,40 @@ jobs:
           unzip -o "rakshi-cinematic-app*.zip"
           mkdir -p app/src/main/java/com/rakshi/cinematic
 
+
+      - name: Bundle On-Device Image Labelling Model
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          choices = [Path("app/build.gradle.kts"), Path("app/build.gradle")]
+          build = next((p for p in choices if p.exists()), None)
+          if build is None:
+              raise SystemExit("App Gradle file not found")
+          text = build.read_text()
+          dependency = 'com.google.mlkit:image-labeling:17.0.9'
+          if dependency not in text:
+              text += '\ndependencies {\n    implementation("' + dependency + '")\n}\n'
+          build.write_text(text)
+          PY
+
       - name: Write Engine and Compose UI
         run: |
           cat << 'EOF' > app/src/main/java/com/rakshi/cinematic/MainActivity.kt
           package com.rakshi.cinematic
 
           import android.content.Context
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.os.Build
+          import android.provider.MediaStore
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.label.ImageLabeling
+          import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+          import kotlinx.coroutines.currentCoroutineContext
+          import kotlinx.coroutines.ensureActive
+          import java.util.concurrent.TimeUnit
           import android.media.MediaMetadataRetriever
           import android.net.Uri
           import android.os.Bundle
@@ -85,49 +113,183 @@ jobs:
           }
 
           object VideoAnalysisEngine {
-              fun selectClips(
-                  durationMs: Long,
-                  uri: Uri,
-                  targetMs: Long = 60_000L
-              ): List<HighlightSegment> {
-                  require(durationMs > 0L) {
-                      "Could not read a valid video duration."
-                  }
+              data class Candidate(val sourceUri: Uri, val sourceIndex: Int, val startMs: Long, val endMs: Long, val score: Double)
+
+              suspend fun selectClips(
+                  context: Context,
+                  uris: List<Uri>,
+                  preset: String,
+                  targetMs: Long,
+                  onProgress: suspend (Int) -> Unit
+              ): List<HighlightSegment> = withContext(Dispatchers.IO) {
+                  require(uris.isNotEmpty()) { "Select at least one video." }
                   require(targetMs > 0L)
-
-                  val selectedMs = minOf(durationMs, targetMs)
-                  val segmentCount = minOf(
-                      10L,
-                      (selectedMs / 1000L).coerceAtLeast(1L)
-                  ).toInt()
-
-                  val baseLength = selectedMs / segmentCount
-                  val remainder = selectedMs % segmentCount
-                  val unusedMs = durationMs - selectedMs
-
-                  var consumedMs = 0L
-
-                  return List(segmentCount) { index ->
-                      val lengthMs = baseLength +
-                          if (index.toLong() < remainder) 1L else 0L
-
-                      val gapOffset = if (segmentCount > 1) {
-                          unusedMs * index / (segmentCount - 1)
-                      } else {
-                          unusedMs / 2L
+                  val candidates = mutableListOf<Candidate>()
+                  var readableFrames = 0
+                  var totalDurationMs = 0L
+                  val labeler = ImageLabeling.getClient(
+                      ImageLabelerOptions.Builder().setConfidenceThreshold(0.35f).build()
+                  )
+                  try {
+                    for ((sourceIndex, uri) in uris.withIndex()) {
+                      currentCoroutineContext().ensureActive()
+                      val retriever = MediaMetadataRetriever()
+                      try {
+                      retriever.setDataSource(context, uri)
+                      val durationMs = retriever.extractMetadata(
+                          MediaMetadataRetriever.METADATA_KEY_DURATION
+                      )?.toLongOrNull() ?: 0L
+                      require(durationMs > 0L) { "Cannot read video "+(sourceIndex+1)+". Remove it and retry." }
+                      totalDurationMs += durationMs
+                      val windowMs = 4_000L
+                      val windowCount = (durationMs - 1L) / windowMs + 1L
+                      val candidateCount = minOf(windowCount, (1200L / uris.size).coerceAtLeast(1L)).toInt()
+                      var previousPixels: DoubleArray? = null
+                      for (index in 0 until candidateCount) {
+                          currentCoroutineContext().ensureActive()
+                          val windowIndex = if (candidateCount > 1) {
+                              index.toLong() * (windowCount - 1L) / (candidateCount - 1L)
+                          } else 0L
+                          val start = windowIndex * windowMs
+                          val end = minOf(start + windowMs, durationMs)
+                          val atMs = start + (end - start) / 2L
+                          val frame = if (Build.VERSION.SDK_INT >= 27) {
+                              retriever.getScaledFrameAtTime(
+                                  atMs * 1000L,
+                                  MediaMetadataRetriever.OPTION_CLOSEST,
+                                  320, 180
+                              )
+                          } else {
+                              retriever.getFrameAtTime(
+                                  atMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST
+                              )
+                          }
+                          var score = -1.0
+                          if (frame != null) {
+                              var tiny: Bitmap? = null
+                              try {
+                                  val labels = Tasks.await(
+                                      labeler.process(InputImage.fromBitmap(frame, 0)),
+                                      20L, TimeUnit.SECONDS
+                                  )
+                                  readableFrames++
+                                  tiny = Bitmap.createScaledBitmap(frame, 32, 18, true)
+                                  val pixels = IntArray(32 * 18)
+                                  tiny.getPixels(pixels, 0, 32, 0, 0, 32, 18)
+                                  val luminance = DoubleArray(pixels.size) { p ->
+                                      val color = pixels[p]
+                                      (0.2126 * android.graphics.Color.red(color) +
+                                          0.7152 * android.graphics.Color.green(color) +
+                                          0.0722 * android.graphics.Color.blue(color)) / 255.0
+                                  }
+                                  val usableExposure = luminance.count {
+                                      it in 0.06..0.94
+                                  }.toDouble() / luminance.size
+                                  var gradient = 0.0
+                                  var edges = 0
+                                  for (y in 0 until 18) for (x in 0 until 31) {
+                                      val p = y * 32 + x
+                                      gradient += kotlin.math.abs(luminance[p] - luminance[p + 1])
+                                      edges++
+                                  }
+                                  val detail = (gradient / edges * 6.0).coerceIn(0.0, 1.0)
+                                  val previous = previousPixels
+                                  val change = if (previous == null) 0.0 else {
+                                      luminance.indices.sumOf {
+                                          kotlin.math.abs(luminance[it] - previous[it])
+                                      } / luminance.size
+                                  }
+                                  previousPixels = luminance
+                                  val wanted = if (preset == "BIKE") {
+                                      setOf("motorcycle", "motorcycling", "helmet", "vehicle",
+                                          "road", "mountain", "landscape", "sky", "tree")
+                                  } else {
+                                      setOf("car", "vehicle", "road", "wheel", "landscape",
+                                          "mountain", "sky", "building", "tree")
+                                  }
+                                  val semantic = labels.filter { label ->
+                                      wanted.any { keyword ->
+                                          label.text.lowercase(java.util.Locale.ROOT)
+                                              .contains(keyword)
+                                      }
+                                  }.maxOfOrNull { it.confidence.toDouble() } ?: 0.0
+                                  // Neural scene labels + explicit ranking heuristics.
+                                  // Frame differences are not optical flow or stabilization.
+                                  val changePreference = if (change <= 0.20) {
+                                      (change / 0.20).coerceIn(0.0, 1.0)
+                                  } else {
+                                      (1.0 - (change - 0.20) / 0.40).coerceIn(0.0, 1.0)
+                                  }
+                                  score = (0.50 * semantic + 0.25 * usableExposure +
+                                      0.15 * detail + 0.10 * changePreference) * usableExposure
+                              } finally {
+                                  if (tiny != null && tiny !== frame) tiny.recycle()
+                                  frame.recycle()
+                              }
+                          }
+                          candidates.add(Candidate(uri, sourceIndex, start, end, score))
+                          onProgress(((sourceIndex + (index + 1).toDouble() / candidateCount) * 100 / uris.size).toInt())
                       }
-
-                      val startMs = consumedMs + gapOffset
-                      consumedMs += lengthMs
-
-                      HighlightSegment(
-                          sourceUri = uri,
-                          startMs = startMs,
-                          endMs = startMs + lengthMs
-                      )
+                      } finally {
+                          retriever.release()
+                      }
+                    }
+                      require(readableFrames > 0) {
+                          "No frames could be analysed. Try a different video."
+                      }
+                      val desired = minOf(targetMs, totalDurationMs)
+                      var remaining = desired
+                      val chosen = mutableListOf<HighlightSegment>()
+                      // Candidates partition the source, so selected clips cannot overlap.
+                      for (candidate in candidates.filter { it.score >= 0.0 }
+                          .sortedByDescending { it.score }) {
+                          if (remaining <= 0L) break
+                          val length = minOf(candidate.endMs - candidate.startMs, remaining)
+                          chosen.add(HighlightSegment(candidate.sourceUri, candidate.startMs,
+                              candidate.startMs + length))
+                          remaining -= length
+                      }
+                      require(chosen.isNotEmpty()) { "No valid highlights found." }
+                      chosen.sortedWith(compareBy<HighlightSegment> { uris.indexOf(it.sourceUri) }.thenBy { it.startMs })
+                  } finally {
+                      labeler.close()
                   }
               }
           }
+
+          object GalleryExport {
+              fun save(context: Context, file: File): Uri {
+                  require(Build.VERSION.SDK_INT >= 29) {
+                      "Gallery export requires Android 10 or newer."
+                  }
+                  val resolver = context.contentResolver
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/RakshiCinematic")
+                      put(MediaStore.Video.Media.IS_PENDING, 1)
+                  }
+                  val uri = resolver.insert(
+                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+                  ) ?: error("Could not create Gallery video.")
+                  try {
+                      resolver.openOutputStream(uri)?.use { output ->
+                          file.inputStream().use { input -> input.copyTo(output) }
+                      } ?: error("Could not write Gallery video.")
+                      val published = ContentValues().apply {
+                          put(MediaStore.Video.Media.IS_PENDING, 0)
+                      }
+                      check(resolver.update(uri, published, null, null) > 0) {
+                          "Could not publish Gallery video."
+                      }
+                      return uri
+                  } catch (error: Exception) {
+                      resolver.delete(uri, null, null)
+                      throw error
+                  }
+              }
+          }
+
 
           class SimpleRenderEngine(
               private val context: Context
@@ -352,73 +514,42 @@ jobs:
                               mutableStateOf<String?>(null)
                           }
 
+                          var preset by remember { mutableStateOf("CAR") }
+                          var targetSeconds by remember { mutableIntStateOf(60) }
+                          var galleryUri by remember { mutableStateOf<Uri?>(null) }
+                          var isSaving by remember { mutableStateOf(false) }
+                          var sourceUris by remember { mutableStateOf(emptyList<Uri>()) }
+
                           val picker =
                               rememberLauncherForActivityResult(
-                                  ActivityResultContracts.GetContent()
-                              ) { uri: Uri? ->
-                                  if (uri != null) {
+                                  ActivityResultContracts.GetMultipleContents()
+                              ) { uris: List<Uri> ->
+                                  if (uris.isNotEmpty()) {
+                                      sourceUris = uris.distinct()
                                       isAnalyzing = true
                                       cuts = emptyList()
                                       exportedPath = null
+                                      galleryUri = null
                                       statusMessage =
-                                          "Reading video duration..."
+                                          "Reading video and preparing bundled ML model..."
 
                                       lifecycleScope.launch {
                                           try {
-                                              val durationMs =
-                                                  withContext(
-                                                      Dispatchers.IO
-                                                  ) {
-                                                      val retriever =
-                                                          MediaMetadataRetriever()
-
-                                                      try {
-                                                          retriever
-                                                              .setDataSource(
-                                                                  applicationContext,
-                                                                  uri
-                                                              )
-
-                                                          val duration =
-                                                              retriever
-                                                                  .extractMetadata(
-                                                                      MediaMetadataRetriever
-                                                                          .METADATA_KEY_DURATION
-                                                                  )
-                                                                  ?.toLongOrNull()
-
-                                                          require(
-                                                              duration != null &&
-                                                              duration > 0L
-                                                          ) {
-                                                              "Cannot read this video's duration."
-                                                          }
-
-                                                          duration
-                                                      } finally {
-                                                          try {
-                                                              retriever.release()
-                                                          } catch (
-                                                              _: Exception
-                                                          ) {
-                                                          }
-                                                      }
-                                                  }
-
-                                              cuts =
-                                                  VideoAnalysisEngine
-                                                      .selectClips(
-                                                          durationMs,
-                                                          uri
-                                                      )
-
+                                          cuts = VideoAnalysisEngine.selectClips(
+                                              applicationContext, sourceUris,
+                                              preset, targetSeconds * 1000L
+                                          ) { progress ->
+                                              withContext(Dispatchers.Main) {
+                                                  statusMessage = "Analysing frames locally: $progress%"
+                                              }
+                                          }
                                               val seconds =
                                                   cuts.sumOf {
                                                       it.durationMs
                                                   } / 1000.0
 
                                               statusMessage =
-                                                  "Ready: ${cuts.size} clips, ${seconds}s total."
+                                                  "Ready: ${sourceUris.size} videos → ${cuts.size} highlights, ${seconds}s total."
                                           } catch (
                                               cancelled:
                                                   CancellationException
@@ -455,7 +586,7 @@ jobs:
                                   )
 
                                   Text(
-                                      text = "LOCAL VIDEO EDITOR",
+                                      text = "ON-DEVICE SCENE ANALYSIS",
                                       color = Color(0xFFFF5722),
                                       fontSize = 12.sp,
                                       modifier =
@@ -508,10 +639,39 @@ jobs:
 
                                   Text(
                                       text =
-                                          "Evenly spaced clip selection • Up to 60 seconds",
+                                          "ML scene labels + quality ranking • $preset • Target: ${targetSeconds}s",
                                       color = Color.Gray,
                                       fontSize = 12.sp
                                   )
+
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      listOf("CAR", "BIKE").forEach { option ->
+                                          FilterChip(
+                                              selected = preset == option,
+                                              enabled = !isAnalyzing && !isRendering && !isSaving,
+                                              onClick = {
+                                                  preset = option
+                                                  cuts = emptyList()
+                                                  statusMessage = "Select footage to analyse with $option preset."
+                                              },
+                                              label = { Text(option) }
+                                          )
+                                      }
+                                  }
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      listOf(15, 30, 60).forEach { seconds ->
+                                          FilterChip(
+                                              selected = targetSeconds == seconds,
+                                              enabled = !isAnalyzing && !isRendering && !isSaving,
+                                              onClick = {
+                                                  targetSeconds = seconds
+                                                  cuts = emptyList()
+                                                  statusMessage = "Select footage for a ${seconds}s target."
+                                              },
+                                              label = { Text("${seconds}s") }
+                                          )
+                                      }
+                                  }
 
                                   LazyColumn(
                                       modifier = Modifier
@@ -540,7 +700,7 @@ jobs:
                                           ) {
                                               Text(
                                                   text =
-                                                      "Clip ${index + 1}",
+                                                      "Clip ${index + 1} • Video ${sourceUris.indexOf(cut.sourceUri) + 1}",
                                                   color = Color.White
                                               )
 
@@ -565,17 +725,73 @@ jobs:
                                       )
                                   }
 
+                                  if (exportedPath != null && galleryUri == null) {
+                                      Button(
+                                          enabled = !isSaving && !isRendering && !isAnalyzing,
+                                          modifier = Modifier.fillMaxWidth(),
+                                          onClick = {
+                                              val path = exportedPath
+                                              if (path != null) {
+                                                  isSaving = true
+                                                  lifecycleScope.launch {
+                                                      try {
+                                                          galleryUri = withContext(Dispatchers.IO) {
+                                                              GalleryExport.save(
+                                                                  applicationContext, File(path)
+                                                              )
+                                                          }
+                                                          statusMessage = "Saved to Gallery: Movies/RakshiCinematic"
+                                                      } catch (error: Exception) {
+                                                          if (error is CancellationException) throw error
+                                                          statusMessage = "Gallery save failed: ${error.message}"
+                                                      } finally {
+                                                          isSaving = false
+                                                      }
+                                                  }
+                                              }
+                                          }
+                                      ) { Text(if (isSaving) "Saving..." else "Save to Gallery") }
+                                  }
+                                  galleryUri?.let { savedUri ->
+                                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                          Button(onClick = {
+                                              try {
+                                                  startActivity(Intent(Intent.ACTION_VIEW)
+                                                      .setDataAndType(savedUri, "video/mp4")
+                                                      .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                                              } catch (_: Exception) {
+                                                  statusMessage = "Open Samsung Gallery to play the saved reel."
+                                              }
+                                          }) { Text("Play") }
+                                          Button(onClick = {
+                                              try {
+                                                  val send = Intent(Intent.ACTION_SEND).apply {
+                                                      type = "video/mp4"
+                                                      putExtra(Intent.EXTRA_STREAM, savedUri)
+                                                      clipData = android.content.ClipData.newRawUri(
+                                                          "Rakshi reel", savedUri
+                                                      )
+                                                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                  }
+                                                  startActivity(Intent.createChooser(send, "Share reel"))
+                                              } catch (_: Exception) {
+                                                  statusMessage = "Could not open a sharing app."
+                                              }
+                                          }) { Text("Share") }
+                                      }
+                                  }
+
                                   Button(
                                       onClick = {
                                           picker.launch("video/*")
                                       },
                                       enabled =
                                           !isAnalyzing &&
-                                          !isRendering,
+                                          !isRendering && !isSaving,
                                       modifier =
                                           Modifier.fillMaxWidth()
                                   ) {
-                                      Text("Select GoPro Footage")
+                                      Text("Select GoPro Videos")
                                   }
 
                                   Button(
@@ -586,6 +802,7 @@ jobs:
                                           isRendering = true
                                           renderProgress = 0
                                           exportedPath = null
+                                          galleryUri = null
                                           statusMessage =
                                               "Exporting locally..."
 
@@ -627,7 +844,7 @@ jobs:
                                                                       state.file
                                                                           .absolutePath
                                                                   statusMessage =
-                                                                      "Export complete."
+                                                                      "Export complete. Tap Save to Gallery."
                                                               }
 
                                                               is SimpleRenderEngine
@@ -656,7 +873,7 @@ jobs:
                                       enabled =
                                           cuts.isNotEmpty() &&
                                           !isAnalyzing &&
-                                          !isRendering,
+                                          !isRendering && !isSaving,
                                       modifier =
                                           Modifier.fillMaxWidth(),
                                       colors =
@@ -696,3 +913,4 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 7
+

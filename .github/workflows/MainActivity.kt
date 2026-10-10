@@ -1,0 +1,850 @@
+package com.rakshi.cinematic
+
+import android.content.Context
+import android.content.ContentValues
+import android.content.Intent
+import android.graphics.Bitmap
+import android.os.Build
+import android.provider.MediaStore
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.label.ImageLabeling
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import java.util.concurrent.TimeUnit
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+import androidx.lifecycle.lifecycleScope
+
+import androidx.media3.common.MediaItem
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+import java.io.File
+
+data class HighlightSegment(
+    val sourceUri: Uri,
+    val startMs: Long,
+    val endMs: Long
+) {
+    val durationMs: Long
+        get() = endMs - startMs
+}
+
+object VideoAnalysisEngine {
+    data class Candidate(val sourceUri: Uri, val sourceIndex: Int, val startMs: Long, val endMs: Long, val score: Double)
+
+    suspend fun selectClips(
+        context: Context,
+        uris: List<Uri>,
+        preset: String,
+        targetMs: Long,
+        onProgress: suspend (Int) -> Unit
+    ): List<HighlightSegment> = withContext(Dispatchers.IO) {
+        require(uris.isNotEmpty()) { "Select at least one video." }
+        require(targetMs > 0L)
+        val candidates = mutableListOf<Candidate>()
+        var readableFrames = 0
+        var totalDurationMs = 0L
+        val labeler = ImageLabeling.getClient(
+            ImageLabelerOptions.Builder().setConfidenceThreshold(0.35f).build()
+        )
+        try {
+          for ((sourceIndex, uri) in uris.withIndex()) {
+            currentCoroutineContext().ensureActive()
+            val retriever = MediaMetadataRetriever()
+            try {
+            retriever.setDataSource(context, uri)
+            val durationMs = retriever.extractMetadata(
+                MediaMetadataRetriever.METADATA_KEY_DURATION
+            )?.toLongOrNull() ?: 0L
+            require(durationMs > 0L) { "Cannot read video "+(sourceIndex+1)+". Remove it and retry." }
+            totalDurationMs += durationMs
+            val windowMs = 4_000L
+            val windowCount = (durationMs - 1L) / windowMs + 1L
+            val candidateCount = minOf(windowCount, (1200L / uris.size).coerceAtLeast(1L)).toInt()
+            var previousPixels: DoubleArray? = null
+            for (index in 0 until candidateCount) {
+                currentCoroutineContext().ensureActive()
+                val windowIndex = if (candidateCount > 1) {
+                    index.toLong() * (windowCount - 1L) / (candidateCount - 1L)
+                } else 0L
+                val start = windowIndex * windowMs
+                val end = minOf(start + windowMs, durationMs)
+                val atMs = start + (end - start) / 2L
+                val frame = if (Build.VERSION.SDK_INT >= 27) {
+                    retriever.getScaledFrameAtTime(
+                        atMs * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST,
+                        320, 180
+                    )
+                } else {
+                    retriever.getFrameAtTime(
+                        atMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST
+                    )
+                }
+                var score = -1.0
+                if (frame != null) {
+                    var tiny: Bitmap? = null
+                    try {
+                        val labels = Tasks.await(
+                            labeler.process(InputImage.fromBitmap(frame, 0)),
+                            20L, TimeUnit.SECONDS
+                        )
+                        readableFrames++
+                        tiny = Bitmap.createScaledBitmap(frame, 32, 18, true)
+                        val pixels = IntArray(32 * 18)
+                        tiny.getPixels(pixels, 0, 32, 0, 0, 32, 18)
+                        val luminance = DoubleArray(pixels.size) { p ->
+                            val color = pixels[p]
+                            (0.2126 * android.graphics.Color.red(color) +
+                                0.7152 * android.graphics.Color.green(color) +
+                                0.0722 * android.graphics.Color.blue(color)) / 255.0
+                        }
+                        val usableExposure = luminance.count {
+                            it in 0.06..0.94
+                        }.toDouble() / luminance.size
+                        var gradient = 0.0
+                        var edges = 0
+                        for (y in 0 until 18) for (x in 0 until 31) {
+                            val p = y * 32 + x
+                            gradient += kotlin.math.abs(luminance[p] - luminance[p + 1])
+                            edges++
+                        }
+                        val detail = (gradient / edges * 6.0).coerceIn(0.0, 1.0)
+                        val previous = previousPixels
+                        val change = if (previous == null) 0.0 else {
+                            luminance.indices.sumOf {
+                                kotlin.math.abs(luminance[it] - previous[it])
+                            } / luminance.size
+                        }
+                        previousPixels = luminance
+                        val wanted = if (preset == "BIKE") {
+                            setOf("motorcycle", "motorcycling", "helmet", "vehicle",
+                                "road", "mountain", "landscape", "sky", "tree")
+                        } else {
+                            setOf("car", "vehicle", "road", "wheel", "landscape",
+                                "mountain", "sky", "building", "tree")
+                        }
+                        val semantic = labels.filter { label ->
+                            wanted.any { keyword ->
+                                label.text.lowercase(java.util.Locale.ROOT)
+                                    .contains(keyword)
+                            }
+                        }.maxOfOrNull { it.confidence.toDouble() } ?: 0.0
+                        // Neural scene labels + explicit ranking heuristics.
+                        // Frame differences are not optical flow or stabilization.
+                        val changePreference = if (change <= 0.20) {
+                            (change / 0.20).coerceIn(0.0, 1.0)
+                        } else {
+                            (1.0 - (change - 0.20) / 0.40).coerceIn(0.0, 1.0)
+                        }
+                        score = (0.50 * semantic + 0.25 * usableExposure +
+                            0.15 * detail + 0.10 * changePreference) * usableExposure
+                    } finally {
+                        if (tiny != null && tiny !== frame) tiny.recycle()
+                        frame.recycle()
+                    }
+                }
+                candidates.add(Candidate(uri, sourceIndex, start, end, score))
+                onProgress(((sourceIndex + (index + 1).toDouble() / candidateCount) * 100 / uris.size).toInt())
+            }
+            } finally {
+                retriever.release()
+            }
+          }
+            require(readableFrames > 0) {
+                "No frames could be analysed. Try a different video."
+            }
+            val desired = minOf(targetMs, totalDurationMs)
+            var remaining = desired
+            val chosen = mutableListOf<HighlightSegment>()
+            // Candidates partition the source, so selected clips cannot overlap.
+            for (candidate in candidates.filter { it.score >= 0.0 }
+                .sortedByDescending { it.score }) {
+                if (remaining <= 0L) break
+                val length = minOf(candidate.endMs - candidate.startMs, remaining)
+                chosen.add(HighlightSegment(candidate.sourceUri, candidate.startMs,
+                    candidate.startMs + length))
+                remaining -= length
+            }
+            require(chosen.isNotEmpty()) { "No valid highlights found." }
+            chosen.sortedWith(compareBy<HighlightSegment> { uris.indexOf(it.sourceUri) }.thenBy { it.startMs })
+        } finally {
+            labeler.close()
+        }
+    }
+}
+
+object GalleryExport {
+    fun save(context: Context, file: File): Uri {
+        require(Build.VERSION.SDK_INT >= 29) {
+            "Gallery export requires Android 10 or newer."
+        }
+        val resolver = context.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/RakshiCinematic")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+        ) ?: error("Could not create Gallery video.")
+        try {
+            resolver.openOutputStream(uri)?.use { output ->
+                file.inputStream().use { input -> input.copyTo(output) }
+            } ?: error("Could not write Gallery video.")
+            val published = ContentValues().apply {
+                put(MediaStore.Video.Media.IS_PENDING, 0)
+            }
+            check(resolver.update(uri, published, null, null) > 0) {
+                "Could not publish Gallery video."
+            }
+            return uri
+        } catch (error: Exception) {
+            resolver.delete(uri, null, null)
+            throw error
+        }
+    }
+}
+
+
+class SimpleRenderEngine(
+    private val context: Context
+) {
+    sealed interface RenderState {
+        data class Progress(
+            val percentage: Int
+        ) : RenderState
+
+        data class Completed(
+            val file: File
+        ) : RenderState
+
+        data class Error(
+            val message: String
+        ) : RenderState
+    }
+
+    fun exportReel(
+        cuts: List<HighlightSegment>,
+        outputFile: File
+    ): Flow<RenderState> = callbackFlow {
+        val handler = Handler(Looper.getMainLooper())
+        var transformer: Transformer? = null
+        var progressTask: Runnable? = null
+        var finished = false
+
+        try {
+            require(cuts.isNotEmpty()) {
+                "No clips selected."
+            }
+
+            cuts.forEach { cut ->
+                require(
+                    cut.startMs >= 0L &&
+                    cut.endMs > cut.startMs
+                ) {
+                    "Invalid clip boundaries."
+                }
+            }
+
+            outputFile.parentFile?.let { directory ->
+                check(
+                    directory.isDirectory ||
+                    directory.mkdirs()
+                ) {
+                    "Could not create output directory."
+                }
+            }
+
+            if (outputFile.exists()) {
+                check(outputFile.delete()) {
+                    "Could not replace output file."
+                }
+            }
+
+            val items = cuts.map { cut ->
+                val clipping =
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(cut.startMs)
+                        .setEndPositionMs(cut.endMs)
+                        .build()
+
+                val mediaItem = MediaItem.Builder()
+                    .setUri(cut.sourceUri)
+                    .setClippingConfiguration(clipping)
+                    .build()
+
+                EditedMediaItem.Builder(mediaItem).build()
+            }
+
+            val sequence = EditedMediaItemSequence(items)
+            val composition =
+                Composition.Builder(listOf(sequence)).build()
+
+            val exporter = Transformer.Builder(context)
+                .addListener(
+                    object : Transformer.Listener {
+                        override fun onCompleted(
+                            composition: Composition,
+                            exportResult: ExportResult
+                        ) {
+                            finished = true
+                            trySend(RenderState.Progress(100))
+                            trySend(
+                                RenderState.Completed(outputFile)
+                            )
+                            close()
+                        }
+
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            finished = true
+                            trySend(
+                                RenderState.Error(
+                                    exportException.message
+                                        ?: "Export failed."
+                                )
+                            )
+                            close()
+                        }
+                    }
+                )
+                .build()
+
+            transformer = exporter
+            val holder = ProgressHolder()
+
+            val poller = object : Runnable {
+                override fun run() {
+                    if (finished || isClosedForSend) {
+                        return
+                    }
+
+                    try {
+                        val state =
+                            exporter.getProgress(holder)
+
+                        if (
+                            state ==
+                            Transformer.PROGRESS_STATE_AVAILABLE
+                        ) {
+                            trySend(
+                                RenderState.Progress(
+                                    holder.progress
+                                        .coerceIn(0, 100)
+                                )
+                            )
+                        }
+
+                        handler.postDelayed(this, 300L)
+                    } catch (error: Exception) {
+                        finished = true
+                        trySend(
+                            RenderState.Error(
+                                error.message
+                                    ?: "Progress check failed."
+                            )
+                        )
+                        close()
+                    }
+                }
+            }
+
+            progressTask = poller
+            exporter.start(
+                composition,
+                outputFile.absolutePath
+            )
+            handler.postDelayed(poller, 200L)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            finished = true
+            trySend(
+                RenderState.Error(
+                    error.message
+                        ?: "Could not initialize export."
+                )
+            )
+            close()
+        }
+
+        awaitClose {
+            finished = true
+
+            progressTask?.let {
+                handler.removeCallbacks(it)
+            }
+
+            val activeTransformer = transformer
+            if (activeTransformer != null) {
+                if (
+                    Looper.myLooper() ==
+                    Looper.getMainLooper()
+                ) {
+                    activeTransformer.cancel()
+                } else {
+                    handler.post {
+                        activeTransformer.cancel()
+                    }
+                }
+            }
+        }
+    }.flowOn(Dispatchers.Main.immediate)
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(
+        savedInstanceState: Bundle?
+    ) {
+        super.onCreate(savedInstanceState)
+
+        val renderEngine =
+            SimpleRenderEngine(applicationContext)
+
+        setContent {
+            MaterialTheme {
+                var statusMessage by remember {
+                    mutableStateOf(
+                        "Select GoPro footage to begin."
+                    )
+                }
+                var isAnalyzing by remember {
+                    mutableStateOf(false)
+                }
+                var isRendering by remember {
+                    mutableStateOf(false)
+                }
+                var renderProgress by remember {
+                    mutableIntStateOf(0)
+                }
+                var cuts by remember {
+                    mutableStateOf(
+                        emptyList<HighlightSegment>()
+                    )
+                }
+                var exportedPath by remember {
+                    mutableStateOf<String?>(null)
+                }
+
+                var preset by remember { mutableStateOf("CAR") }
+                var targetSeconds by remember { mutableIntStateOf(60) }
+                var galleryUri by remember { mutableStateOf<Uri?>(null) }
+                var isSaving by remember { mutableStateOf(false) }
+                var sourceUris by remember { mutableStateOf(emptyList<Uri>()) }
+
+                val picker =
+                    rememberLauncherForActivityResult(
+                        ActivityResultContracts.GetMultipleContents()
+                    ) { uris: List<Uri> ->
+                        if (uris.isNotEmpty()) {
+                            sourceUris = uris.distinct()
+                            isAnalyzing = true
+                            cuts = emptyList()
+                            exportedPath = null
+                            galleryUri = null
+                            statusMessage =
+                                "Reading video and preparing bundled ML model..."
+
+                            lifecycleScope.launch {
+                                try {
+                                cuts = VideoAnalysisEngine.selectClips(
+                                    applicationContext, sourceUris,
+                                    preset, targetSeconds * 1000L
+                                ) { progress ->
+                                    withContext(Dispatchers.Main) {
+                                        statusMessage = "Analysing frames locally: $progress%"
+                                    }
+                                }
+                                    val seconds =
+                                        cuts.sumOf {
+                                            it.durationMs
+                                        } / 1000.0
+
+                                    statusMessage =
+                                        "Ready: ${sourceUris.size} videos → ${cuts.size} highlights, ${seconds}s total."
+                                } catch (
+                                    cancelled:
+                                        CancellationException
+                                ) {
+                                    throw cancelled
+                                } catch (error: Exception) {
+                                    statusMessage =
+                                        error.message
+                                            ?: "Could not read video."
+                                } finally {
+                                    isAnalyzing = false
+                                }
+                            }
+                        }
+                    }
+
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = Color(0xFF0F1015)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .systemBarsPadding()
+                            .padding(20.dp),
+                        horizontalAlignment =
+                            Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = "RAKSHI CINEMATIC",
+                            color = Color.White,
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        Text(
+                            text = "ON-DEVICE SCENE ANALYSIS",
+                            color = Color(0xFFFF5722),
+                            fontSize = 12.sp,
+                            modifier =
+                                Modifier.padding(top = 6.dp)
+                        )
+
+                        Spacer(
+                            Modifier.height(18.dp)
+                        )
+
+                        Text(
+                            text = statusMessage,
+                            color = Color.LightGray,
+                            fontSize = 14.sp
+                        )
+
+                        Spacer(
+                            Modifier.height(12.dp)
+                        )
+
+                        if (isAnalyzing) {
+                            CircularProgressIndicator(
+                                color = Color(0xFFFF5722)
+                            )
+                        }
+
+                        if (isRendering) {
+                            LinearProgressIndicator(
+                                progress = {
+                                    renderProgress / 100f
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp),
+                                color = Color(0xFFFF5722)
+                            )
+
+                            Text(
+                                text =
+                                    "$renderProgress% exported",
+                                color = Color.White,
+                                modifier = Modifier
+                                    .padding(top = 8.dp)
+                            )
+                        }
+
+                        Spacer(
+                            Modifier.height(12.dp)
+                        )
+
+                        Text(
+                            text =
+                                "ML scene labels + quality ranking • $preset • Target: ${targetSeconds}s",
+                            color = Color.Gray,
+                            fontSize = 12.sp
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("CAR", "BIKE").forEach { option ->
+                                FilterChip(
+                                    selected = preset == option,
+                                    enabled = !isAnalyzing && !isRendering && !isSaving,
+                                    onClick = {
+                                        preset = option
+                                        cuts = emptyList()
+                                        statusMessage = "Select footage to analyse with $option preset."
+                                    },
+                                    label = { Text(option) }
+                                )
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(15, 30, 60).forEach { seconds ->
+                                FilterChip(
+                                    selected = targetSeconds == seconds,
+                                    enabled = !isAnalyzing && !isRendering && !isSaving,
+                                    onClick = {
+                                        targetSeconds = seconds
+                                        cuts = emptyList()
+                                        statusMessage = "Select footage for a ${seconds}s target."
+                                    },
+                                    label = { Text("${seconds}s") }
+                                )
+                            }
+                        }
+
+                        LazyColumn(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp)
+                        ) {
+                            itemsIndexed(cuts) {
+                                index, cut ->
+
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(
+                                            vertical = 4.dp
+                                        )
+                                        .background(
+                                            Color(0xFF1B1D26),
+                                            RoundedCornerShape(
+                                                10.dp
+                                            )
+                                        )
+                                        .padding(12.dp),
+                                    horizontalArrangement =
+                                        Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text =
+                                            "Clip ${index + 1} • Video ${sourceUris.indexOf(cut.sourceUri) + 1}",
+                                        color = Color.White
+                                    )
+
+                                    Text(
+                                        text =
+                                            "${cut.startMs / 1000.0}s – ${cut.endMs / 1000.0}s",
+                                        color =
+                                            Color.LightGray
+                                    )
+                                }
+                            }
+                        }
+
+                        exportedPath?.let { path ->
+                            Text(
+                                text = "Saved:\n$path",
+                                color = Color(0xFF4CAF50),
+                                fontSize = 12.sp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 12.dp)
+                            )
+                        }
+
+                        if (exportedPath != null && galleryUri == null) {
+                            Button(
+                                enabled = !isSaving && !isRendering && !isAnalyzing,
+                                modifier = Modifier.fillMaxWidth(),
+                                onClick = {
+                                    val path = exportedPath
+                                    if (path != null) {
+                                        isSaving = true
+                                        lifecycleScope.launch {
+                                            try {
+                                                galleryUri = withContext(Dispatchers.IO) {
+                                                    GalleryExport.save(
+                                                        applicationContext, File(path)
+                                                    )
+                                                }
+                                                statusMessage = "Saved to Gallery: Movies/RakshiCinematic"
+                                            } catch (error: Exception) {
+                                                if (error is CancellationException) throw error
+                                                statusMessage = "Gallery save failed: ${error.message}"
+                                            } finally {
+                                                isSaving = false
+                                            }
+                                        }
+                                    }
+                                }
+                            ) { Text(if (isSaving) "Saving..." else "Save to Gallery") }
+                        }
+                        galleryUri?.let { savedUri ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    try {
+                                        startActivity(Intent(Intent.ACTION_VIEW)
+                                            .setDataAndType(savedUri, "video/mp4")
+                                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                                    } catch (_: Exception) {
+                                        statusMessage = "Open Samsung Gallery to play the saved reel."
+                                    }
+                                }) { Text("Play") }
+                                Button(onClick = {
+                                    try {
+                                        val send = Intent(Intent.ACTION_SEND).apply {
+                                            type = "video/mp4"
+                                            putExtra(Intent.EXTRA_STREAM, savedUri)
+                                            clipData = android.content.ClipData.newRawUri(
+                                                "Rakshi reel", savedUri
+                                            )
+                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        startActivity(Intent.createChooser(send, "Share reel"))
+                                    } catch (_: Exception) {
+                                        statusMessage = "Could not open a sharing app."
+                                    }
+                                }) { Text("Share") }
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                picker.launch("video/*")
+                            },
+                            enabled =
+                                !isAnalyzing &&
+                                !isRendering && !isSaving,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                        ) {
+                            Text("Select GoPro Videos")
+                        }
+
+                        Button(
+                            onClick = {
+                                val selectedCuts =
+                                    cuts.toList()
+
+                                isRendering = true
+                                renderProgress = 0
+                                exportedPath = null
+                                galleryUri = null
+                                statusMessage =
+                                    "Exporting locally..."
+
+                                lifecycleScope.launch {
+                                    try {
+                                        val directory =
+                                            applicationContext
+                                                .getExternalFilesDir(
+                                                    Environment
+                                                        .DIRECTORY_MOVIES
+                                                )
+                                                ?: error(
+                                                    "Movie storage is unavailable."
+                                                )
+
+                                        val output = File(
+                                            directory,
+                                            "RAKSHI_REEL_${System.currentTimeMillis()}.mp4"
+                                        )
+
+                                        renderEngine
+                                            .exportReel(
+                                                selectedCuts,
+                                                output
+                                            )
+                                            .collect { state ->
+                                                when (state) {
+                                                    is SimpleRenderEngine
+                                                        .RenderState
+                                                        .Progress -> {
+                                                        renderProgress =
+                                                            state.percentage
+                                                    }
+
+                                                    is SimpleRenderEngine
+                                                        .RenderState
+                                                        .Completed -> {
+                                                        exportedPath =
+                                                            state.file
+                                                                .absolutePath
+                                                        statusMessage =
+                                                            "Export complete. Tap Save to Gallery."
+                                                    }
+
+                                                    is SimpleRenderEngine
+                                                        .RenderState
+                                                        .Error -> {
+                                                        statusMessage =
+                                                            "Export failed: ${state.message}"
+                                                    }
+                                                }
+                                            }
+                                    } catch (
+                                        cancelled:
+                                            CancellationException
+                                    ) {
+                                        throw cancelled
+                                    } catch (
+                                        error: Exception
+                                    ) {
+                                        statusMessage =
+                                            "Export failed: ${error.message}"
+                                    } finally {
+                                        isRendering = false
+                                    }
+                                }
+                            },
+                            enabled =
+                                cuts.isNotEmpty() &&
+                                !isAnalyzing &&
+                                !isRendering && !isSaving,
+                            modifier =
+                                Modifier.fillMaxWidth(),
+                            colors =
+                                ButtonDefaults.buttonColors(
+                                    containerColor =
+                                        Color(0xFFFF5722)
+                                )
+                        ) {
+                            Text("Export Reel")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
